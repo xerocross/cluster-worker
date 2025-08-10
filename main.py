@@ -26,9 +26,12 @@ SHARED_ROOT = config["shared_root"]
 REDIS_HOST = config["redis_host"]
 REDIS_PORT = config.get("redis_port", 6379)
 REDIS_QUEUE = config.get("redis_queue", "tasks")
+REDIS_DEAD_QUEUE = config.get("redis_dead_queue", "dead_tasks")
 LOG_FILE = config.get("log_file", "/mnt/cluster/cluster.log")
 JOB_CAPABILITIES = config.get("capabilities")
 CONTROL_CHANNEL = f"worker_control:{WORKER_NAME}"
+MAX_RETRIES = 3
+REDIS_ACTIVE_JOBS_KEY = "cluster_jobs_in_flight"
 
 # Event to control pause/resume behavior
 is_ready = threading.Event()
@@ -67,7 +70,7 @@ def should_accept_job(job):
         logger.info(f"[{job.get('id')}] Skipping: CPU usage {current_cpu:.1f}% > limit {cpu_requirement}%")
         return False
     if current_mem_mb < mem_requiremenet:
-        logger.info(f"[{job.get('id')}] Skipping: Memory available {int(current_mem_mb)}MB < required {mem_requiremenet}MB")
+        logger.info(f"[{job.get('id')}] Skipping: Memory available {int(current_mem_mb)} MB < required {mem_requiremenet} MB")
         return False    
     
     return True
@@ -80,13 +83,17 @@ def heartbeat_loop(node_name, job_id, stop_event):
             "job_id": job_id,
             "updated_at": now
         })
-        logger.info(f"[{job_id}] in progress at {now}")
+        r.hset(f"jobstatus:{job_id}", mapping = {
+            "status": "IN PROGRESS",
+            "heartbeat": now                     
+        })
         time.sleep(5)  # heartbeat every 5 seconds
 
 # 🚀 Main Worker Loop
 def main():
     
     logger.info("Worker started. Waiting for jobs...")
+    r.hset("node_status", WORKER_NAME, "ready") 
 
     listener_thread = threading.Thread(target=listen_for_commands, daemon=True)
     listener_thread.start()
@@ -117,6 +124,20 @@ def main():
                 r.rpush(REDIS_QUEUE, job_json)
                 time.sleep(10)  # Optional backoff
                 continue
+            
+            now = datetime.now(nyc_tz).isoformat()
+            r.hset(f"jobstatus:{job_id}", mapping = {
+                "node": WORKER_NAME,
+                "job_type" : job_type,
+                "status": "STARTING",
+                "start_time" : now
+            })
+            r.hset(f"node:{WORKER_NAME}", mapping = {
+                "status": "busy",
+                "job_id" : job_id
+            })
+
+            r.sadd(REDIS_ACTIVE_JOBS_KEY, job_id)
 
             if job_type == "compress-video":
                 handler = get_handler_for_type(job_type)
@@ -125,23 +146,36 @@ def main():
                 result = test_job(job)
             else:
                 logger.warning(f"[{job_id}] ❌ Unsupported job type: {job_type}")
+                r.hset(f"jobstatus:{job_id}", "status", "UNSUPPORTED")
                 result = "unsupported"
 
             if result == "error":
+                r.hset(f"jobstatus:{job_id}", "status", "ERR")
                 retries = job.get("retries", 0)
-                if retries < 3:
+                if retries < MAX_RETRIES:
                     job["retries"] = retries + 1
-                    logger.info(f"[{job_id}] 🔁 Re-queuing job (attempt {job['retries']}/3)")
+                    r.hset(f"jobstatus:{job_id}", "status", "RETRYING")
+                    r.hset(f"jobstatus:{job_id}", "retry_attempts", f"{job['retries']}/{MAX_RETRIES}")
+                    logger.info(f"[{job_id}] 🔁 Re-queuing job (attempt {job['retries']}/{MAX_RETRIES})")
                     r.rpush(REDIS_QUEUE, json.dumps(job))
                 else:
-                    logger.error(f"[{job_id}] ❌ Job failed after 3 attempts. Giving up.")
+                    r.rpush(REDIS_DEAD_QUEUE, json.dumps(job))
+                    r.hset(f"jobstatus:{job_id}", "status", "FAILED")
+                    logger.error(f"[{job_id}] ❌ Job failed after {MAX_RETRIES} attempts. Job put on DEAD QUEUE.")
+            elif result == "success":
+                r.hset(f"jobstatus:{job_id}", mapping = {
+                    "status": "SUCCESS",                 
+                })
 
         except json.JSONDecodeError:
             logger.error("❌ Received malformed JSON job.")
+            r.rpush(REDIS_DEAD_QUEUE, job_json)
         except Exception as e:
             logger.exception(f"❌ Unexpected error while handling job: {e}")
+            r.rpush(REDIS_DEAD_QUEUE, job_json)
         finally:
             stop_event.set()
+            r.srem(REDIS_ACTIVE_JOBS_KEY, job_id)
             r.delete(f"heartbeat:{WORKER_NAME}")  # Clear when done
 
 def listen_for_commands():

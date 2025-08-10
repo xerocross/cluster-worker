@@ -24,7 +24,7 @@ def handle(job, config):
     try:
         subprocess.run(command, check=True)
         logger.info(f"[{job['id']}] ✅ Video compression complete: {output_path}")
-        return "done"
+        return "success"
     except Exception as e:
         logger.error(f"[{job['id']}] ❌ Unexpected Error occurred during video compression", exc_info=True)
         return "error"
